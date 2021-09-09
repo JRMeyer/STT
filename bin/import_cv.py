@@ -1,81 +1,80 @@
 #!/usr/bin/env python
+"""
+Broadly speaking, this script takes the audio downloaded from Common Voice
+for a certain language, in addition to the *.tsv files output by CorporaCreator,
+and the script formats the data and transcripts to be in a state usable by
+train.py
+Use "python3 import_cv.py -h" for help
+"""
 import csv
 import os
 import subprocess
-import sys
-import tarfile
-from glob import glob
+import unicodedata
 from multiprocessing import Pool
 
 import progressbar
 import sox
-from coqui_stt_training.util.downloader import SIMPLE_BAR, maybe_download
+from coqui_stt_ctcdecoder import Alphabet
+from coqui_stt_training.util.downloader import SIMPLE_BAR
 from coqui_stt_training.util.importers import (
     get_counter,
     get_imported_samples,
+    get_importers_parser,
+    get_validate_label,
     print_import_report,
 )
-from coqui_stt_training.util.importers import validate_label_eng as validate_label
 
 FIELDNAMES = ["wav_filename", "wav_filesize", "transcript"]
 SAMPLE_RATE = 16000
-MAX_SECS = 10
-ARCHIVE_DIR_NAME = "cv_corpus_v1"
-ARCHIVE_NAME = ARCHIVE_DIR_NAME + ".tar.gz"
-ARCHIVE_URL = (
-    "https://s3.us-east-2.amazonaws.com/common-voice-data-download/" + ARCHIVE_NAME
-)
+CHANNELS = 1
+PARAMS = None
+FILTER_OBJ = None
 
 
-def _download_and_preprocess_data(target_dir):
-    # Making path absolute
-    target_dir = os.path.abspath(target_dir)
-    # Conditionally download data
-    archive_path = maybe_download(ARCHIVE_NAME, target_dir, ARCHIVE_URL)
-    # Conditionally extract common voice data
-    _maybe_extract(target_dir, ARCHIVE_DIR_NAME, archive_path)
-    # Conditionally convert common voice CSV files and mp3 data to Coqui STT CSVs and wav
-    _maybe_convert_sets(target_dir, ARCHIVE_DIR_NAME)
+class LabelFilter:
+    def __init__(self, normalize, alphabet, validate_fun):
+        self.normalize = normalize
+        self.alphabet = alphabet
+        self.validate_fun = validate_fun
+
+    def filter(self, label):
+        if self.normalize:
+            label = (
+                unicodedata.normalize("NFKD", label.strip())
+                .encode("ascii", "ignore")
+                .decode("ascii", "ignore")
+            )
+        label = self.validate_fun(label)
+        if self.alphabet and label and not self.alphabet.CanEncode(label):
+            label = None
+        return label
 
 
-def _maybe_extract(target_dir, extracted_data, archive_path):
-    # If target_dir/extracted_data does not exist, extract archive in target_dir
-    extracted_path = os.join(target_dir, extracted_data)
-    if not os.path.exists(extracted_path):
-        print('No directory "%s" - extracting archive...' % extracted_path)
-        with tarfile.open(archive_path) as tar:
-            tar.extractall(target_dir)
-    else:
-        print('Found directory "%s" - not extracting it from archive.' % extracted_path)
-
-
-def _maybe_convert_sets(target_dir, extracted_data):
-    extracted_dir = os.path.join(target_dir, extracted_data)
-    for source_csv in glob(os.path.join(extracted_dir, "*.csv")):
-        _maybe_convert_set(
-            extracted_dir,
-            source_csv,
-            os.path.join(target_dir, os.path.split(source_csv)[-1]),
-        )
+def init_worker(params):
+    global FILTER_OBJ  # pylint: disable=global-statement
+    validate_label = get_validate_label(params)
+    alphabet = Alphabet(params.filter_alphabet) if params.filter_alphabet else None
+    FILTER_OBJ = LabelFilter(params.normalize, alphabet, validate_label)
 
 
 def one_sample(sample):
+    """ Take an audio file, and optionally convert it to 16kHz WAV """
     mp3_filename = sample[0]
+    if not os.path.splitext(mp3_filename.lower())[1] == ".mp3":
+        mp3_filename += ".mp3"
     # Storing wav files next to the mp3 ones - just with a different suffix
-    wav_filename = path.splitext(mp3_filename)[0] + ".wav"
+    wav_filename = os.path.splitext(mp3_filename)[0] + ".wav"
     _maybe_convert_wav(mp3_filename, wav_filename)
-    frames = int(
-        subprocess.check_output(["soxi", "-s", wav_filename], stderr=subprocess.STDOUT)
-    )
     file_size = -1
+    frames = 0
     if os.path.exists(wav_filename):
-        file_size = path.getsize(wav_filename)
+        file_size = os.path.getsize(wav_filename)
         frames = int(
             subprocess.check_output(
                 ["soxi", "-s", wav_filename], stderr=subprocess.STDOUT
             )
         )
-    label = validate_label(sample[1])
+    label = FILTER_OBJ.filter(sample[1])
     rows = []
     counter = get_counter()
     if file_size == -1:
@@ -87,76 +86,171 @@ def one_sample(sample):
     elif int(frames / SAMPLE_RATE * 1000 / 10 / 2) < len(str(label)):
         # Excluding samples that are too short to fit the transcript
         counter["too_short"] += 1
-    elif frames / SAMPLE_RATE > MAX_SECS:
+    elif frames / SAMPLE_RATE > PARAMS.max_seconds:
         # Excluding very long samples to keep a reasonable batch-size
         counter["too_long"] += 1
     else:
         # This one is good - keep it for the target CSV
-        rows.append((wav_filename, file_size, label))
+        rows.append((os.path.split(wav_filename)[-1], file_size, label, sample[2]))
         counter["imported_time"] += frames
     counter["all"] += 1
     counter["total_time"] += frames
+
     return (counter, rows)
 
 
-def _maybe_convert_set(extracted_dir, source_csv, target_csv):
-    print()
-    if os.path.exists(target_csv):
-        print('Found CSV file "%s" - not importing "%s".' % (target_csv, source_csv))
-        return
-    print('No CSV file "%s" - importing "%s"...' % (target_csv, source_csv))
-    samples = []
-    with open(source_csv) as source_csv_file:
-        reader = csv.DictReader(source_csv_file)
-        for row in reader:
-            samples.append((os.path.join(extracted_dir, row["filename"]), row["text"]))
+def _maybe_convert_set(
+    dataset,
+    tsv_dir,
+    audio_dir,
+    filter_obj,
+    space_after_every_character=None,
+    rows=None,
+    exclude=None,
+):
+    exclude_transcripts = set()
+    exclude_speakers = set()
+    if exclude is not None:
+        for sample in exclude:
+            exclude_transcripts.add(sample[2])
+            exclude_speakers.add(sample[3])
 
-    # Mutable counters for the concurrent embedded routine
-    counter = get_counter()
-    num_samples = len(samples)
-    rows = []
+    if rows is None:
+        rows = []
+        input_tsv = os.path.join(os.path.abspath(tsv_dir), dataset + ".tsv")
+        if not os.path.isfile(input_tsv):
+            return rows
+        print("Loading TSV file: ", input_tsv)
+        # Get audiofile path and transcript for each sentence in tsv
+        samples = []
+        with open(input_tsv, encoding="utf-8") as input_tsv_file:
+            reader = csv.DictReader(input_tsv_file, delimiter="\t")
+            for row in reader:
+                samples.append(
+                    (
+                        os.path.join(audio_dir, row["path"]),
+                        row["sentence"],
+                        row["client_id"],
+                    )
+                )
 
-    print("Importing mp3 files...")
-    pool = Pool()
-    bar = progressbar.ProgressBar(max_value=num_samples, widgets=SIMPLE_BAR)
-    for i, processed in enumerate(pool.imap_unordered(one_sample, samples), start=1):
-        counter += processed[0]
-        rows += processed[1]
-        bar.update(i)
-    bar.update(num_samples)
-    pool.close()
-    pool.join()
+        counter = get_counter()
+        num_samples = len(samples)
 
-    print('Writing "%s"...' % target_csv)
-    with open(target_csv, "w", encoding="utf-8", newline="") as target_csv_file:
-        writer = csv.DictWriter(target_csv_file, fieldnames=FIELDNAMES)
+        print("Importing mp3 files...")
+        pool = Pool(initializer=init_worker, initargs=(PARAMS,))
+        bar = progressbar.ProgressBar(max_value=num_samples, widgets=SIMPLE_BAR)
+        for i, processed in enumerate(
+            pool.imap_unordered(one_sample, samples), start=1
+        ):
+            counter += processed[0]
+            rows += processed[1]
+            bar.update(i)
+        bar.update(num_samples)
+        pool.close()
+        pool.join()
+
+        imported_samples = get_imported_samples(counter)
+        assert counter["all"] == num_samples
+        assert len(rows) == imported_samples
+        print_import_report(counter, SAMPLE_RATE, PARAMS.max_seconds)
+
+    output_csv = os.path.join(os.path.abspath(audio_dir), dataset + ".csv")
+    print("Saving new Coqui STT-formatted CSV file to: ", output_csv)
+    with open(output_csv, "w", encoding="utf-8", newline="") as output_csv_file:
+        print("Writing CSV file for train.py as: ", output_csv)
+        writer = csv.DictWriter(output_csv_file, fieldnames=FIELDNAMES)
         writer.writeheader()
         bar = progressbar.ProgressBar(max_value=len(rows), widgets=SIMPLE_BAR)
-        for filename, file_size, transcript in bar(rows):
-            writer.writerow(
-                {
-                    "wav_filename": filename,
-                    "wav_filesize": file_size,
-                    "transcript": transcript,
-                }
+        for filename, file_size, transcript, speaker in bar(rows):
+            if transcript in exclude_transcripts or speaker in exclude_speakers:
+                continue
+            if space_after_every_character:
+                writer.writerow(
+                    {
+                        "wav_filename": filename,
+                        "wav_filesize": file_size,
+                        "transcript": " ".join(transcript),
+                    }
+                )
+            else:
+                writer.writerow(
+                    {
+                        "wav_filename": filename,
+                        "wav_filesize": file_size,
+                        "transcript": transcript,
+                    }
+                )
+    return rows
+
+
+def _preprocess_data(tsv_dir, audio_dir, space_after_every_character=False):
+    exclude = []
+    for dataset in ["test", "dev", "train", "validated", "other"]:
+        set_samples = _maybe_convert_set(
+            dataset, tsv_dir, audio_dir, space_after_every_character
+        )
+        if dataset in ["test", "dev"]:
+            exclude += set_samples
+        if dataset == "validated":
+            _maybe_convert_set(
+                "train-all",
+                tsv_dir,
+                audio_dir,
+                space_after_every_character,
+                rows=set_samples,
+                exclude=exclude,
             )
-
-    imported_samples = get_imported_samples(counter)
-    assert counter["all"] == num_samples
-    assert len(rows) == imported_samples
-
-    print_import_report(counter, SAMPLE_RATE, MAX_SECS)
 
 
 def _maybe_convert_wav(mp3_filename, wav_filename):
     if not os.path.exists(wav_filename):
         transformer = sox.Transformer()
-        transformer.convert(samplerate=SAMPLE_RATE)
+        transformer.convert(samplerate=SAMPLE_RATE, n_channels=CHANNELS)
         try:
             transformer.build(mp3_filename, wav_filename)
         except sox.core.SoxError:
             pass
 
 
+def parse_args():
+    parser = get_importers_parser(description="Import Common Voice corpora")
+    parser.add_argument("tsv_dir", help="Directory containing tsv files")
+    parser.add_argument(
+        "--audio_dir",
+        help='Path to directory containing audio clips. Defaults to "<tsv_dir>/clips"',
+    )
+    parser.add_argument(
+        "--filter_alphabet",
+        help="Exclude samples with characters not in provided alphabet",
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Convert diacritic characters to their base",
+    )
+    parser.add_argument(
+        "--space_after_every_character",
+        action="store_true",
+        help="To help transcript join by white space",
+    )
+    parser.add_argument(
+        "--max_seconds",
+        help="Discard audio longer than max_seconds",
+        type=int,
+        default=10,
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    audio_dir = (
+        PARAMS.audio_dir if PARAMS.audio_dir else os.path.join(PARAMS.tsv_dir, "clips")
+    )
+    _preprocess_data(PARAMS.tsv_dir, audio_dir, PARAMS.space_after_every_character)
+
+
 if __name__ == "__main__":
-    _download_and_preprocess_data(sys.argv[1])
+    PARAMS = parse_args()
+    main()
